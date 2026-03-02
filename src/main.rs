@@ -9,6 +9,12 @@ use std::{
 };
 use tree_sitter::{Parser, Tree};
 
+const COLOR_RESET: &str = "\x1b[0m";
+const COLOR_PATH_DIM: &str = "\x1b[90m";
+const COLOR_LINE_NUM: &str = "\x1b[36m";
+const COLOR_META_MILD: &str = "\x1b[2;37m";
+const COLOR_HIGHLIGHT: &str = "\x1b[1;33m";
+
 #[derive(Debug, Deserialize)]
 struct RgEventLine {
     #[serde(rename = "type")]
@@ -57,6 +63,8 @@ struct MatchOccurrence {
 struct ParsedFile {
     source: String,
     lines: Vec<String>,
+    line_starts: Vec<usize>,
+    line_ends: Vec<usize>,
     tree: Tree,
 }
 
@@ -74,7 +82,7 @@ struct OutputRecord {
     node_type: String,
     node_line_from: usize,
     node_line_to: usize,
-    covered_lines: String,
+    rendered_lines: String,
 }
 
 struct LanguageAnalyzer {
@@ -131,7 +139,8 @@ impl LanguageAnalyzer {
 
         match node {
             Some(current) => {
-                let (from, to, covered_lines) = node_lines(parsed, current);
+                let (from, to, rendered_lines) =
+                    node_lines_with_highlight(parsed, current, global_start, global_end);
                 Some(OutputRecord {
                     path: m.path.clone(),
                     line_num: m.line_num,
@@ -139,7 +148,7 @@ impl LanguageAnalyzer {
                     node_type: current.kind().to_string(),
                     node_line_from: from,
                     node_line_to: to,
-                    covered_lines,
+                    rendered_lines,
                 })
             }
             None => {
@@ -177,11 +186,14 @@ impl LanguageAnalyzer {
         };
 
         let lines = source.lines().map(ToString::to_string).collect::<Vec<_>>();
+        let (line_starts, line_ends) = compute_line_offsets(&source);
         self.files.insert(
             path.to_string(),
             ParsedFile {
                 source,
                 lines,
+                line_starts,
+                line_ends,
                 tree,
             },
         );
@@ -212,9 +224,24 @@ fn language_for_path(path: &str) -> Option<LanguageKind> {
     }
 }
 
-fn node_lines(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> (usize, usize, String) {
+fn compute_line_offsets(source: &str) -> (Vec<usize>, Vec<usize>) {
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    let mut offset = 0usize;
+
+    for segment in source.split_inclusive('\n') {
+        starts.push(offset);
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        ends.push(offset.saturating_add(line.len()));
+        offset = offset.saturating_add(segment.len());
+    }
+
+    (starts, ends)
+}
+
+fn node_row_bounds(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> (usize, usize) {
     if parsed.lines.is_empty() {
-        return (0, 0, String::new());
+        return (0, 0);
     }
 
     let start_row = node.start_position().row;
@@ -226,13 +253,53 @@ fn node_lines(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> (usize, usize
     let last = parsed.lines.len() - 1;
     let from = start_row.min(last);
     let to = end_row.min(last);
-    let covered = if from <= to {
-        parsed.lines[from..=to].join("\n")
-    } else {
-        String::new()
-    };
+    (from, to)
+}
 
-    (from + 1, to + 1, covered)
+fn render_with_highlight(
+    source: &str,
+    segment_start: usize,
+    segment_end: usize,
+    highlight_start: usize,
+    highlight_end: usize,
+) -> String {
+    let overlap_start = highlight_start.max(segment_start);
+    let overlap_end = highlight_end.min(segment_end);
+
+    if overlap_start >= overlap_end {
+        return String::from_utf8_lossy(&source.as_bytes()[segment_start..segment_end]).to_string();
+    }
+
+    let bytes = source.as_bytes();
+    let prefix = String::from_utf8_lossy(&bytes[segment_start..overlap_start]);
+    let highlighted = String::from_utf8_lossy(&bytes[overlap_start..overlap_end]);
+    let suffix = String::from_utf8_lossy(&bytes[overlap_end..segment_end]);
+
+    format!("{prefix}{COLOR_HIGHLIGHT}{highlighted}{COLOR_RESET}{suffix}")
+}
+
+fn node_lines_with_highlight(
+    parsed: &ParsedFile,
+    node: tree_sitter::Node<'_>,
+    match_start: usize,
+    match_end: usize,
+) -> (usize, usize, String) {
+    if parsed.lines.is_empty() {
+        return (0, 0, String::new());
+    }
+
+    let (from, to) = node_row_bounds(parsed, node);
+    let segment_start = parsed.line_starts[from];
+    let segment_end = parsed.line_ends[to];
+    let rendered = render_with_highlight(
+        &parsed.source,
+        segment_start,
+        segment_end,
+        match_start,
+        match_end,
+    );
+
+    (from + 1, to + 1, rendered)
 }
 
 fn parse_match_occurrences(line: &str) -> Option<Vec<MatchOccurrence>> {
@@ -398,13 +465,13 @@ fn main() {
 
     for out in outputs {
         println!(
-            "{}:{} node_type={} node_lines=[{}..{}]\n{}",
+            "{COLOR_PATH_DIM}{}{COLOR_RESET}:{COLOR_LINE_NUM}{}{COLOR_RESET} {COLOR_META_MILD}node_type={} node_lines=[{}..{}]{COLOR_RESET}\n{}",
             out.path,
             out.line_num,
             out.node_type,
             out.node_line_from,
             out.node_line_to,
-            out.covered_lines
+            out.rendered_lines
         );
     }
 
