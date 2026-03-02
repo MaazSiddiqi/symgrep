@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::{self, BufRead, BufReader},
+    path::Path,
     process::{Command, Stdio},
     time::Instant,
 };
@@ -35,8 +36,16 @@ struct SubmatchData {
     end: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum LanguageKind {
+    Rust,
+    TypeScript,
+    Tsx,
+}
+
+#[derive(Debug, Clone)]
 struct MatchOccurrence {
+    path: String,
     line_num: u64,
     line_text: String,
     absolute_offset: usize,
@@ -57,18 +66,28 @@ struct CacheStats {
     misses: usize,
 }
 
-struct Analyzer {
+#[derive(Debug)]
+struct OutputRecord {
+    path: String,
+    line_num: u64,
+    submatch_start: usize,
+    node_type: String,
+    node_line_from: usize,
+    node_line_to: usize,
+    covered_lines: String,
+}
+
+struct LanguageAnalyzer {
     parser: Parser,
     files: HashMap<String, ParsedFile>,
     stats: CacheStats,
 }
 
-impl Analyzer {
-    fn new() -> Result<Self, String> {
+impl LanguageAnalyzer {
+    fn new(language: LanguageKind) -> Result<Self, String> {
         let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .map_err(|_| "Failed to initialize tree-sitter Rust grammar".to_string())?;
+        set_parser_language(&mut parser, language)
+            .map_err(|msg| format!("Failed to initialize parser: {msg}"))?;
 
         Ok(Self {
             parser,
@@ -77,14 +96,10 @@ impl Analyzer {
         })
     }
 
-    fn handle_match(&mut self, path: &str, m: MatchOccurrence) {
-        if !path.ends_with(".rs") {
-            return;
-        }
-
-        let parsed = match self.get_or_parse_file(path) {
+    fn analyze_match(&mut self, m: &MatchOccurrence) -> Option<OutputRecord> {
+        let parsed = match self.get_or_parse_file(&m.path) {
             Some(p) => p,
-            None => return,
+            None => return None,
         };
 
         let global_start = m.absolute_offset.saturating_add(m.submatch_start);
@@ -92,20 +107,21 @@ impl Analyzer {
 
         if global_end <= global_start {
             eprintln!(
-                "warning: skipping invalid range for {path}:{} line_range=[{}..{}]",
-                m.line_num, m.submatch_start, m.submatch_end
+                "warning: skipping invalid range for {}:{} line_range=[{}..{}]",
+                m.path, m.line_num, m.submatch_start, m.submatch_end
             );
-            return;
+            return None;
         }
         if global_start >= parsed.source.len() || global_end > parsed.source.len() {
             eprintln!(
-                "warning: skipping out-of-bounds range for {path}:{} file_range=[{}..{}] source_len={}",
+                "warning: skipping out-of-bounds range for {}:{} file_range=[{}..{}] source_len={}",
+                m.path,
                 m.line_num,
                 global_start,
                 global_end,
                 parsed.source.len()
             );
-            return;
+            return None;
         }
 
         let root = parsed.tree.root_node();
@@ -116,21 +132,24 @@ impl Analyzer {
         match node {
             Some(current) => {
                 let (from, to, covered_lines) = node_lines(parsed, current);
-                println!(
-                    "{path}:{} node_type={} node_lines=[{}..{}]\n{}",
-                    m.line_num,
-                    current.kind(),
-                    from,
-                    to,
-                    covered_lines
-                );
+                Some(OutputRecord {
+                    path: m.path.clone(),
+                    line_num: m.line_num,
+                    submatch_start: m.submatch_start,
+                    node_type: current.kind().to_string(),
+                    node_line_from: from,
+                    node_line_to: to,
+                    covered_lines,
+                })
             }
             None => {
                 eprintln!(
-                    "warning: no syntax node found for {path}:{} text={}",
+                    "warning: no syntax node found for {}:{} text={}",
+                    m.path,
                     m.line_num,
                     m.line_text.trim_end()
                 );
+                None
             }
         }
     }
@@ -171,6 +190,28 @@ impl Analyzer {
     }
 }
 
+fn set_parser_language(parser: &mut Parser, language: LanguageKind) -> Result<(), &'static str> {
+    let result = match language {
+        LanguageKind::Rust => parser.set_language(&tree_sitter_rust::LANGUAGE.into()),
+        LanguageKind::TypeScript => {
+            parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        }
+        LanguageKind::Tsx => parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()),
+    };
+
+    result.map_err(|_| "unsupported tree-sitter language")
+}
+
+fn language_for_path(path: &str) -> Option<LanguageKind> {
+    let extension = Path::new(path).extension()?.to_str()?;
+    match extension {
+        "rs" => Some(LanguageKind::Rust),
+        "ts" | "js" => Some(LanguageKind::TypeScript),
+        "tsx" | "jsx" => Some(LanguageKind::Tsx),
+        _ => None,
+    }
+}
+
 fn node_lines(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> (usize, usize, String) {
     if parsed.lines.is_empty() {
         return (0, 0, String::new());
@@ -194,7 +235,7 @@ fn node_lines(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> (usize, usize
     (from + 1, to + 1, covered)
 }
 
-fn parse_match_occurrences(line: &str) -> Option<(String, Vec<MatchOccurrence>)> {
+fn parse_match_occurrences(line: &str) -> Option<Vec<MatchOccurrence>> {
     let event: RgEventLine = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(err) => {
@@ -224,6 +265,7 @@ fn parse_match_occurrences(line: &str) -> Option<(String, Vec<MatchOccurrence>)>
         .submatches
         .into_iter()
         .map(|sm| MatchOccurrence {
+            path: path.clone(),
             line_num,
             line_text: line_text.clone(),
             absolute_offset,
@@ -232,10 +274,13 @@ fn parse_match_occurrences(line: &str) -> Option<(String, Vec<MatchOccurrence>)>
         })
         .collect::<Vec<_>>();
 
-    Some((path, occurrences))
+    Some(occurrences)
 }
 
-fn stream_ripgrep(path: &str, pattern: &str, analyzer: &mut Analyzer) -> io::Result<()> {
+fn stream_ripgrep(
+    path: &str,
+    pattern: &str,
+) -> io::Result<BTreeMap<LanguageKind, Vec<MatchOccurrence>>> {
     let mut child = Command::new("rg")
         .arg("-i")
         .arg(pattern)
@@ -253,11 +298,18 @@ fn stream_ripgrep(path: &str, pattern: &str, analyzer: &mut Analyzer) -> io::Res
     };
 
     let reader = BufReader::new(stdout);
+    let mut matches_by_language: BTreeMap<LanguageKind, Vec<MatchOccurrence>> = BTreeMap::new();
+
     for line in reader.lines() {
         let line = line?;
-        if let Some((matched_path, occurrences)) = parse_match_occurrences(&line) {
+        if let Some(occurrences) = parse_match_occurrences(&line) {
             for occurrence in occurrences {
-                analyzer.handle_match(&matched_path, occurrence);
+                if let Some(language) = language_for_path(&occurrence.path) {
+                    matches_by_language
+                        .entry(language)
+                        .or_default()
+                        .push(occurrence);
+                }
             }
         }
     }
@@ -267,28 +319,70 @@ fn stream_ripgrep(path: &str, pattern: &str, analyzer: &mut Analyzer) -> io::Res
         eprintln!("ripgrep exited with status: {status}");
     }
 
-    Ok(())
+    Ok(matches_by_language)
 }
 
 fn main() {
     let start = Instant::now();
-
-    let mut analyzer = match Analyzer::new() {
+    let matches_by_language = match stream_ripgrep("./", "arg") {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("{err}");
+            eprintln!("ripgrep stream failed: {err}");
             return;
         }
     };
 
-    if let Err(err) = stream_ripgrep("./", "arg", &mut analyzer) {
-        eprintln!("ripgrep stream failed: {err}");
-        return;
+    let mut analyzers: HashMap<LanguageKind, LanguageAnalyzer> = HashMap::new();
+    let mut outputs: Vec<OutputRecord> = Vec::new();
+
+    for (language, matches) in matches_by_language {
+        if !analyzers.contains_key(&language) {
+            match LanguageAnalyzer::new(language) {
+                Ok(analyzer) => {
+                    analyzers.insert(language, analyzer);
+                }
+                Err(err) => {
+                    eprintln!("warning: skipping language analyzer init error: {err}");
+                    continue;
+                }
+            }
+        }
+        let analyzer = match analyzers.get_mut(&language) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        for m in matches {
+            if let Some(record) = analyzer.analyze_match(&m) {
+                outputs.push(record);
+            }
+        }
     }
 
+    outputs.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line_num.cmp(&b.line_num))
+            .then(a.submatch_start.cmp(&b.submatch_start))
+    });
+
+    for out in outputs {
+        println!(
+            "{}:{} node_type={} node_lines=[{}..{}]\n{}",
+            out.path,
+            out.line_num,
+            out.node_type,
+            out.node_line_from,
+            out.node_line_to,
+            out.covered_lines
+        );
+    }
+
+    let total_hits: usize = analyzers.values().map(|a| a.stats.hits).sum();
+    let total_misses: usize = analyzers.values().map(|a| a.stats.misses).sum();
     let elapsed = start.elapsed();
     println!(
         "Completed in {:?} (cache hits: {}, misses: {})",
-        elapsed, analyzer.stats.hits, analyzer.stats.misses
+        elapsed, total_hits, total_misses
     );
 }
