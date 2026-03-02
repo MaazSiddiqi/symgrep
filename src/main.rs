@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
-    fs,
+    env, fs,
     io::{self, BufRead, BufReader},
     path::Path,
     process::{Command, Stdio},
@@ -322,9 +322,39 @@ fn stream_ripgrep(
     Ok(matches_by_language)
 }
 
+fn parse_cli_args() -> Result<(String, String), String> {
+    let args = env::args().collect::<Vec<_>>();
+    let bin = args
+        .first()
+        .map(String::as_str)
+        .unwrap_or("project-symgrep");
+    let usage = format!("Usage: {bin} <pattern> [path]");
+
+    match args.len() {
+        2 => {
+            let pattern = args[1].clone();
+            let path = env::current_dir()
+                .map_err(|err| format!("{usage}\nFailed to determine current directory: {err}"))?
+                .to_string_lossy()
+                .to_string();
+            Ok((pattern, path))
+        }
+        3 => Ok((args[1].clone(), args[2].clone())),
+        _ => Err(usage),
+    }
+}
+
 fn main() {
     let start = Instant::now();
-    let matches_by_language = match stream_ripgrep("./", "arg") {
+    let (pattern, path) = match parse_cli_args() {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return;
+        }
+    };
+
+    let matches_by_language = match stream_ripgrep(&path, &pattern) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("ripgrep stream failed: {err}");
