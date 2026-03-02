@@ -86,6 +86,7 @@ struct OutputRecord {
 }
 
 struct LanguageAnalyzer {
+    language: LanguageKind,
     parser: Parser,
     files: HashMap<String, ParsedFile>,
     stats: CacheStats,
@@ -98,6 +99,7 @@ impl LanguageAnalyzer {
             .map_err(|msg| format!("Failed to initialize parser: {msg}"))?;
 
         Ok(Self {
+            language,
             parser,
             files: HashMap::new(),
             stats: CacheStats::default(),
@@ -105,6 +107,7 @@ impl LanguageAnalyzer {
     }
 
     fn analyze_match(&mut self, m: &MatchOccurrence) -> Option<OutputRecord> {
+        let language = self.language;
         let parsed = match self.get_or_parse_file(&m.path) {
             Some(p) => p,
             None => return None,
@@ -139,8 +142,9 @@ impl LanguageAnalyzer {
 
         match node {
             Some(current) => {
+                let bounds_node = select_context_node(parsed, root, current, language);
                 let (from, to, rendered_lines) =
-                    node_lines_with_highlight(parsed, current, global_start, global_end);
+                    node_lines_with_highlight(parsed, bounds_node, global_start, global_end);
                 Some(OutputRecord {
                     path: m.path.clone(),
                     line_num: m.line_num,
@@ -222,6 +226,103 @@ fn language_for_path(path: &str) -> Option<LanguageKind> {
         "tsx" | "jsx" => Some(LanguageKind::Tsx),
         _ => None,
     }
+}
+
+fn is_root_like(node: tree_sitter::Node<'_>, root: tree_sitter::Node<'_>) -> bool {
+    let same_as_root_range =
+        node.start_byte() == root.start_byte() && node.end_byte() == root.end_byte();
+    let root_like_kind = matches!(node.kind(), "source_file" | "program");
+    same_as_root_range || root_like_kind
+}
+
+fn node_line_span(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> usize {
+    let (from, to) = node_row_bounds(parsed, node);
+    to.saturating_sub(from).saturating_add(1)
+}
+
+fn kind_is_tiny(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "shorthand_property_identifier"
+            | "string_content"
+    )
+}
+
+fn kind_is_context(language: LanguageKind, kind: &str) -> bool {
+    match language {
+        LanguageKind::Rust => matches!(
+            kind,
+            "let_declaration"
+                | "assignment_expression"
+                | "call_expression"
+                | "if_expression"
+                | "for_expression"
+                | "while_expression"
+                | "match_expression"
+                | "block"
+                | "function_item"
+        ),
+        LanguageKind::TypeScript | LanguageKind::Tsx => matches!(
+            kind,
+            "variable_declarator"
+                | "assignment_expression"
+                | "call_expression"
+                | "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "statement_block"
+                | "function_declaration"
+                | "method_definition"
+        ),
+    }
+}
+
+fn select_context_node<'a>(
+    parsed: &ParsedFile,
+    root: tree_sitter::Node<'a>,
+    current: tree_sitter::Node<'a>,
+    language: LanguageKind,
+) -> tree_sitter::Node<'a> {
+    const MIN_CONTEXT_LINES: usize = 2;
+    const MAX_CONTEXT_LINES: usize = 20;
+    const MAX_ANCESTOR_STEPS: usize = 8;
+
+    let mut selected = current;
+    let mut cursor = current;
+
+    for _ in 0..MAX_ANCESTOR_STEPS {
+        let parent = match cursor.parent() {
+            Some(p) => p,
+            None => break,
+        };
+        if is_root_like(parent, root) {
+            break;
+        }
+
+        let parent_span = node_line_span(parsed, parent);
+        if parent_span > MAX_CONTEXT_LINES {
+            break;
+        }
+
+        let selected_span = node_line_span(parsed, selected);
+        let need_more_context = selected_span < MIN_CONTEXT_LINES || kind_is_tiny(selected.kind());
+        let parent_is_context = kind_is_context(language, parent.kind());
+
+        if need_more_context || parent_is_context {
+            selected = parent;
+        }
+
+        if parent_is_context && node_line_span(parsed, selected) >= MIN_CONTEXT_LINES {
+            break;
+        }
+
+        cursor = parent;
+    }
+
+    selected
 }
 
 fn compute_line_offsets(source: &str) -> (Vec<usize>, Vec<usize>) {
