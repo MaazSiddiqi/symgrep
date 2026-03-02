@@ -1,3 +1,3 @@
 [commands]
+run = "./target/debug/project-symgrep usePaginated ../../ReactJS/onova/earth"
 build = "cargo build"
-run = "./target/debug/project-symgrep useSearchEndpoint ../../ReactJS/onova/earth"

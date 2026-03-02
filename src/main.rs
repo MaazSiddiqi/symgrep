@@ -287,7 +287,7 @@ fn select_context_node<'a>(
     language: LanguageKind,
 ) -> tree_sitter::Node<'a> {
     const MIN_CONTEXT_LINES: usize = 2;
-    const MAX_CONTEXT_LINES: usize = 20;
+    const MAX_CONTEXT_LINES: usize = 200;
     const MAX_ANCESTOR_STEPS: usize = 8;
 
     let mut selected = current;
