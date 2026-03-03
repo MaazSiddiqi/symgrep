@@ -6,7 +6,7 @@ mod ripgrep;
 
 use std::env;
 
-use crate::engine::SymgrepEngine;
+use crate::engine::Engine;
 
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_PATH_DIM: &str = "\x1b[90m";
@@ -52,5 +52,5 @@ fn main() {
         }
     };
 
-    SymgrepEngine::run(&path, &pattern);
+    Engine::run(&path, &pattern);
 }

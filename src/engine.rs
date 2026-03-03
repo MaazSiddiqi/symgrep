@@ -17,7 +17,7 @@ struct CacheStats {
     misses: usize,
 }
 
-pub struct SymgrepEngine {
+pub struct Engine {
     analyzer: Analyzer,
     stats: CacheStats,
 }
@@ -42,7 +42,7 @@ struct MergedSnippet {
     node_types: BTreeSet<String>,
 }
 
-impl SymgrepEngine {
+impl Engine {
     pub fn new() -> Self {
         Self {
             analyzer: Analyzer::new(),
