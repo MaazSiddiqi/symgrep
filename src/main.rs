@@ -52,5 +52,6 @@ fn main() {
         }
     };
 
-    Engine::run(&path, &pattern);
+    let engine = Engine::new();
+    engine.run(&path, &pattern);
 }

@@ -50,9 +50,8 @@ impl Engine {
         }
     }
 
-    pub fn run(path: &str, pattern: &str) {
+    pub fn run(&self, path: &str, pattern: &str) {
         let start = Instant::now();
-        let mut engine = Self::new();
 
         let mut ripgrep = RipGrep::new(GrepConfig::new(pattern, path));
         let matches_by_language = match ripgrep.run() {
