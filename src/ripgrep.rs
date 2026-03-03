@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     io::{self, BufRead, BufReader},
     process::{Command, Stdio},
 };
@@ -41,85 +41,103 @@ struct SubmatchData {
     end: u64,
 }
 
-fn parse_match_occurrences(line: &str) -> Option<Vec<MatchOccurence>> {
-    let event: RgEventLine = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("Failed to parse rg JSON line: {err}\nline: {line}");
-            return None;
-        }
-    };
-
-    if event.event_type != "match" {
-        return None;
-    }
-
-    let m: MatchData = match serde_json::from_value(event.data) {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("Failed to parse rg match payload: {err}");
-            return None;
-        }
-    };
-
-    let path = m.path.text;
-    let line_number = m.line_number;
-    let absolute_offset = m.absolute_offset;
-
-    let occurrences = m
-        .submatches
-        .into_iter()
-        .map(|sm| MatchOccurence {
-            file_path: path.clone(),
-            line_number,
-            start_byte: absolute_offset.saturating_add(sm.start),
-            end_byte: absolute_offset.saturating_add(sm.end),
-        })
-        .collect::<Vec<_>>();
-
-    Some(occurrences)
+#[derive(Debug, Clone)]
+pub struct GrepConfig {
+    pattern: String,
+    path: String,
 }
 
-pub fn stream_ripgrep(
-    path: &str,
-    pattern: &str,
-) -> io::Result<BTreeMap<LanguageKind, Vec<MatchOccurence>>> {
-    let mut child = Command::new("rg")
-        .arg(pattern)
-        .arg(path)
-        .arg("--json")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            return Err(io::Error::other("Failed to capture ripgrep stdout"));
+impl GrepConfig {
+    pub fn new(pattern: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            path: path.into(),
         }
-    };
+    }
+}
 
-    let reader = BufReader::new(stdout);
-    let mut matches_by_language: BTreeMap<LanguageKind, Vec<MatchOccurence>> = BTreeMap::new();
+pub struct RipGrep {
+    config: GrepConfig,
+}
 
-    for line in reader.lines() {
-        let line = line?;
-        if let Some(occurrences) = parse_match_occurrences(&line) {
-            for occurrence in occurrences {
-                if let Some(language) = language_for_path(&occurrence.file_path) {
-                    matches_by_language
-                        .entry(language)
-                        .or_default()
-                        .push(occurrence);
+impl RipGrep {
+    pub fn new(config: GrepConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn run(&mut self) -> Result<HashMap<LanguageKind, Vec<MatchOccurence>>, io::Error> {
+        // NOTE: As POC, we are shelling out to subprocess. In the future, we should use a native Rust implementation
+        // https://docs.rs/grep-searcher/0.1.8/grep_searcher/index.html
+        let mut child = Command::new("rg")
+            .arg(&self.config.pattern)
+            .arg(&self.config.path)
+            .arg("--json")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                return Err(io::Error::other("failed to capture ripgrep stdout"));
+            }
+        };
+
+        let reader = BufReader::new(stdout);
+
+        let mut matches: HashMap<LanguageKind, Vec<MatchOccurence>> = HashMap::new();
+
+        for line in reader.lines() {
+            match self.parse_grep_event(&line?) {
+                Ok(occurrences) => {
+                    for occurrence in occurrences {
+                        match language_for_path(&occurrence.file_path) {
+                            Some(language) => {
+                                matches.entry(language).or_default().push(occurrence);
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("failed to parse rg event: {}", e);
                 }
             }
         }
+
+        let status = child.wait()?;
+        if !status.success() {
+            eprintln!("ripgrep exited with status: {status}");
+        }
+
+        Ok(matches)
     }
 
-    let status = child.wait()?;
-    if !status.success() {
-        eprintln!("ripgrep exited with status: {status}");
-    }
+    fn parse_grep_event(&self, event_json: &str) -> Result<Vec<MatchOccurence>, serde_json::Error> {
+        let event: RgEventLine = serde_json::from_str(event_json)?;
 
-    Ok(matches_by_language)
+        match event.event_type.as_str() {
+            "match" => {
+                let m: MatchData = serde_json::from_value(event.data)?;
+
+                let path = m.path.text;
+                let line_number = m.line_number;
+                let absolute_offset = m.absolute_offset;
+
+                let occurrences: Vec<MatchOccurence> = m
+                    .submatches
+                    .into_iter()
+                    .map(|sm| MatchOccurence {
+                        file_path: path.clone(),
+                        line_number,
+                        start_byte: absolute_offset.saturating_add(sm.start),
+                        end_byte: absolute_offset.saturating_add(sm.end),
+                    })
+                    .collect::<Vec<_>>();
+
+                Ok(occurrences)
+            }
+            _ => Ok(vec![]),
+        }
+    }
 }

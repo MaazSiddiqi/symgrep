@@ -8,7 +8,7 @@ use crate::{
     analyzer::{Analyzer, ParsedFile},
     helpers::{line_bounds_for_byte_range, merge_ranges, render_segment_with_highlights},
     output::{OutputRecord, print_outputs},
-    ripgrep::{MatchOccurence, stream_ripgrep},
+    ripgrep::{GrepConfig, MatchOccurence, RipGrep},
 };
 
 #[derive(Debug, Default)]
@@ -54,7 +54,8 @@ impl SymgrepEngine {
         let start = Instant::now();
         let mut engine = Self::new();
 
-        let matches_by_language = match stream_ripgrep(path, pattern) {
+        let mut ripgrep = RipGrep::new(GrepConfig::new(pattern, path));
+        let matches_by_language = match ripgrep.run() {
             Ok(v) => v,
             Err(err) => {
                 eprintln!("ripgrep stream failed: {err}");
@@ -198,20 +199,10 @@ fn build_output_records_for_file(
                 m.snippet_end,
                 &m.highlights,
             );
-            let node_type = if m.node_types.len() == 1 {
-                m.node_types
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| "unknown".to_string())
-            } else {
-                let joined = m.node_types.into_iter().collect::<Vec<_>>().join(",");
-                format!("multi[{joined}]")
-            };
 
             OutputRecord {
                 path: file_path.to_string(),
                 line_num: m.line_num,
-                node_type,
                 node_line_from,
                 node_line_to,
                 rendered_lines,
