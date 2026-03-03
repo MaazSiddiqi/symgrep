@@ -27,67 +27,81 @@ pub fn compute_line_offsets(source: &str) -> (Vec<usize>, Vec<usize>) {
     (starts, ends)
 }
 
-pub fn node_lines_with_highlight(
-    source: &str,
-    lines: &[String],
+pub fn line_bounds_for_byte_range(
     line_starts: &[usize],
     line_ends: &[usize],
-    node: tree_sitter::Node<'_>,
-    match_start: usize,
-    match_end: usize,
-) -> (usize, usize, String) {
-    if lines.is_empty() {
-        return (0, 0, String::new());
-    }
-
-    let (from, to) = node_row_bounds(lines.len(), node);
-    let segment_start = line_starts[from];
-    let segment_end = line_ends[to];
-    let rendered =
-        render_with_highlight(source, segment_start, segment_end, match_start, match_end);
-
-    (from + 1, to + 1, rendered)
-}
-
-fn node_row_bounds(line_count: usize, node: tree_sitter::Node<'_>) -> (usize, usize) {
-    if line_count == 0 {
+    start_byte: usize,
+    end_byte: usize,
+) -> (usize, usize) {
+    if line_starts.is_empty() || line_ends.is_empty() {
         return (0, 0);
     }
 
-    let start_row = node.start_position().row;
-    let mut end_row = node.end_position().row;
-    if node.end_position().column == 0 && end_row > start_row {
-        end_row = end_row.saturating_sub(1);
-    }
-
-    let last = line_count - 1;
-    let from = start_row.min(last);
-    let to = end_row.min(last);
-    (from, to)
+    let from = find_line_for_byte(line_starts, start_byte);
+    let end_inclusive = end_byte.saturating_sub(1);
+    let to = find_line_for_byte(line_starts, end_inclusive);
+    (from + 1, to + 1)
 }
 
-fn render_with_highlight(
+pub fn render_segment_with_highlights(
     source: &str,
     segment_start: usize,
     segment_end: usize,
-    highlight_start: usize,
-    highlight_end: usize,
+    highlights: &[(usize, usize)],
 ) -> String {
-    let overlap_start = highlight_start.max(segment_start);
-    let overlap_end = highlight_end.min(segment_end);
-
-    if overlap_start >= overlap_end {
-        return String::from_utf8_lossy(&source.as_bytes()[segment_start..segment_end]).to_string();
-    }
+    let mut merged = highlights.to_vec();
+    merged.sort_unstable_by_key(|&(s, e)| (s, e));
+    merged = merge_ranges(&merged);
 
     let bytes = source.as_bytes();
-    let prefix = String::from_utf8_lossy(&bytes[segment_start..overlap_start]);
-    let highlighted = String::from_utf8_lossy(&bytes[overlap_start..overlap_end]);
-    let suffix = String::from_utf8_lossy(&bytes[overlap_end..segment_end]);
+    let mut rendered = String::new();
+    let mut cursor = segment_start;
 
-    format!(
-        "{prefix}{}{highlighted}{}{suffix}",
-        crate::COLOR_HIGHLIGHT,
-        crate::COLOR_RESET
-    )
+    for (start, end) in merged {
+        let overlap_start = start.max(segment_start);
+        let overlap_end = end.min(segment_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        if cursor < overlap_start {
+            rendered.push_str(&String::from_utf8_lossy(&bytes[cursor..overlap_start]));
+        }
+        rendered.push_str(crate::COLOR_HIGHLIGHT);
+        rendered.push_str(&String::from_utf8_lossy(&bytes[overlap_start..overlap_end]));
+        rendered.push_str(crate::COLOR_RESET);
+        cursor = overlap_end;
+    }
+
+    if cursor < segment_end {
+        rendered.push_str(&String::from_utf8_lossy(&bytes[cursor..segment_end]));
+    }
+
+    rendered
+}
+
+pub fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+
+    for &(start, end) in ranges {
+        if end <= start {
+            continue;
+        }
+
+        match merged.last_mut() {
+            Some((last_start, last_end)) if start <= *last_end => {
+                *last_end = (*last_end).max(end);
+                *last_start = (*last_start).min(start);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+
+    merged
+}
+
+fn find_line_for_byte(line_starts: &[usize], byte: usize) -> usize {
+    let idx = line_starts.partition_point(|&s| s <= byte);
+    idx.saturating_sub(1)
+        .min(line_starts.len().saturating_sub(1))
 }

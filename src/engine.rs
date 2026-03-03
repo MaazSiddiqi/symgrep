@@ -1,9 +1,12 @@
-use std::time::Instant;
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::Instant,
+};
 
 use crate::{
     LanguageKind,
     analyzer::{Analyzer, ParsedFile},
-    helpers::node_lines_with_highlight,
+    helpers::{line_bounds_for_byte_range, merge_ranges, render_segment_with_highlights},
     output::{OutputRecord, print_outputs},
     ripgrep::{MatchOccurence, stream_ripgrep},
 };
@@ -17,6 +20,26 @@ struct CacheStats {
 pub struct SymgrepEngine {
     analyzer: Analyzer,
     stats: CacheStats,
+}
+
+#[derive(Debug, Clone)]
+struct SnippetCandidate {
+    file_path: String,
+    line_num: u64,
+    node_type: String,
+    snippet_start: usize,
+    snippet_end: usize,
+    match_start: usize,
+    match_end: usize,
+}
+
+#[derive(Debug, Default)]
+struct MergedSnippet {
+    line_num: u64,
+    snippet_start: usize,
+    snippet_end: usize,
+    highlights: Vec<(usize, usize)>,
+    node_types: BTreeSet<String>,
 }
 
 impl SymgrepEngine {
@@ -39,16 +62,34 @@ impl SymgrepEngine {
             }
         };
 
-        let mut outputs: Vec<OutputRecord> = Vec::new();
+        let mut candidates_by_file: HashMap<String, Vec<SnippetCandidate>> = HashMap::new();
 
         for (language, matches) in matches_by_language {
             for m in matches {
-                if let Some(record) = engine.analyze_match(language, &m) {
-                    outputs.push(record);
+                if let Some(candidate) = engine.analyze_match(language, &m) {
+                    candidates_by_file
+                        .entry(candidate.file_path.clone())
+                        .or_default()
+                        .push(candidate);
                 }
             }
         }
 
+        let mut outputs: Vec<OutputRecord> = Vec::new();
+        for (file_path, candidates) in candidates_by_file {
+            let parsed = match engine.analyzer.get_or_load_parsed(&file_path) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("{err}");
+                    continue;
+                }
+            };
+            outputs.extend(build_output_records_for_file(
+                &file_path, parsed, candidates,
+            ));
+        }
+
+        outputs.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_num.cmp(&b.line_num)));
         print_outputs(&outputs);
 
         let elapsed = start.elapsed();
@@ -62,7 +103,7 @@ impl SymgrepEngine {
         &mut self,
         language: LanguageKind,
         m: &MatchOccurence,
-    ) -> Option<OutputRecord> {
+    ) -> Option<SnippetCandidate> {
         if self.analyzer.has_file(&m.file_path) {
             self.stats.hits += 1;
         } else {
@@ -107,22 +148,14 @@ impl SymgrepEngine {
         match node {
             Some(current) => {
                 let bounds_node = select_context_node(parsed, root, current, language);
-                let (from, to, rendered_lines) = node_lines_with_highlight(
-                    &parsed.source,
-                    &parsed.lines,
-                    &parsed.line_starts,
-                    &parsed.line_ends,
-                    bounds_node,
-                    global_start,
-                    global_end,
-                );
-                Some(OutputRecord {
-                    path: m.file_path.clone(),
+                Some(SnippetCandidate {
+                    file_path: m.file_path.clone(),
                     line_num: m.line_number,
                     node_type: current.kind().to_string(),
-                    node_line_from: from,
-                    node_line_to: to,
-                    rendered_lines,
+                    snippet_start: bounds_node.start_byte(),
+                    snippet_end: bounds_node.end_byte(),
+                    match_start: global_start,
+                    match_end: global_end,
                 })
             }
             None => {
@@ -134,6 +167,90 @@ impl SymgrepEngine {
             }
         }
     }
+}
+
+fn build_output_records_for_file(
+    file_path: &str,
+    parsed: &ParsedFile,
+    mut candidates: Vec<SnippetCandidate>,
+) -> Vec<OutputRecord> {
+    candidates.sort_by(|a, b| {
+        a.snippet_start
+            .cmp(&b.snippet_start)
+            .then(a.snippet_end.cmp(&b.snippet_end))
+            .then(a.match_start.cmp(&b.match_start))
+            .then(a.match_end.cmp(&b.match_end))
+    });
+
+    let merged = merge_candidates(candidates);
+    merged
+        .into_iter()
+        .map(|m| {
+            let (node_line_from, node_line_to) = line_bounds_for_byte_range(
+                &parsed.line_starts,
+                &parsed.line_ends,
+                m.snippet_start,
+                m.snippet_end,
+            );
+            let rendered_lines = render_segment_with_highlights(
+                &parsed.source,
+                m.snippet_start,
+                m.snippet_end,
+                &m.highlights,
+            );
+            let node_type = if m.node_types.len() == 1 {
+                m.node_types
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "unknown".to_string())
+            } else {
+                let joined = m.node_types.into_iter().collect::<Vec<_>>().join(",");
+                format!("multi[{joined}]")
+            };
+
+            OutputRecord {
+                path: file_path.to_string(),
+                line_num: m.line_num,
+                node_type,
+                node_line_from,
+                node_line_to,
+                rendered_lines,
+            }
+        })
+        .collect()
+}
+
+fn merge_candidates(candidates: Vec<SnippetCandidate>) -> Vec<MergedSnippet> {
+    let mut out: Vec<MergedSnippet> = Vec::new();
+
+    for c in candidates {
+        match out.last_mut() {
+            Some(current) if c.snippet_start <= current.snippet_end => {
+                current.snippet_end = current.snippet_end.max(c.snippet_end);
+                current.line_num = current.line_num.min(c.line_num);
+                current.highlights.push((c.match_start, c.match_end));
+                current.node_types.insert(c.node_type);
+            }
+            _ => {
+                let mut node_types = BTreeSet::new();
+                node_types.insert(c.node_type);
+                out.push(MergedSnippet {
+                    line_num: c.line_num,
+                    snippet_start: c.snippet_start,
+                    snippet_end: c.snippet_end,
+                    highlights: vec![(c.match_start, c.match_end)],
+                    node_types,
+                });
+            }
+        }
+    }
+
+    for merged in &mut out {
+        merged.highlights.sort_unstable_by_key(|&(s, e)| (s, e));
+        merged.highlights = merge_ranges(&merged.highlights);
+    }
+
+    out
 }
 
 fn select_context_node<'a>(
