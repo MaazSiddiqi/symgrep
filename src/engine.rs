@@ -6,20 +6,15 @@ use std::{
 use crate::{
     LanguageKind,
     analyzer::{Analyzer, ParsedFile},
-    helpers::{line_bounds_for_byte_range, merge_ranges, render_segment_with_highlights},
+    helpers::{
+        language_for_path, line_bounds_for_byte_range, merge_ranges, render_segment_with_highlights,
+    },
     output::{OutputRecord, print_outputs},
     ripgrep::{GrepConfig, MatchOccurence, RipGrep},
 };
 
-#[derive(Debug, Default)]
-struct CacheStats {
-    hits: usize,
-    misses: usize,
-}
-
 pub struct Engine {
     analyzer: Analyzer,
-    stats: CacheStats,
 }
 
 #[derive(Debug, Clone)]
@@ -46,27 +41,34 @@ impl Engine {
     pub fn new() -> Self {
         Self {
             analyzer: Analyzer::new(),
-            stats: CacheStats::default(),
         }
     }
 
-    pub fn run(&self, path: &str, pattern: &str) {
+    pub fn run(&mut self, path: &str, pattern: &str) {
         let start = Instant::now();
 
         let mut ripgrep = RipGrep::new(GrepConfig::new(pattern, path));
-        let matches_by_language = match ripgrep.run() {
+        let matches_by_file = match ripgrep.run() {
             Ok(v) => v,
             Err(err) => {
-                eprintln!("ripgrep stream failed: {err}");
+                eprintln!("ripgrep run failed: {err}");
                 return;
             }
         };
 
         let mut candidates_by_file: HashMap<String, Vec<SnippetCandidate>> = HashMap::new();
 
-        for (language, matches) in matches_by_language {
+        for (file_path, matches) in matches_by_file {
+            let language = match language_for_path(&file_path) {
+                Some(l) => l,
+                None => {
+                    eprintln!("Unknown file extension for file: {file_path}");
+                    continue;
+                }
+            };
+
             for m in matches {
-                if let Some(candidate) = engine.analyze_match(language, &m) {
+                if let Some(candidate) = self.analyze_match(&file_path, language, &m) {
                     candidates_by_file
                         .entry(candidate.file_path.clone())
                         .or_default()
@@ -77,7 +79,7 @@ impl Engine {
 
         let mut outputs: Vec<OutputRecord> = Vec::new();
         for (file_path, candidates) in candidates_by_file {
-            let parsed = match engine.analyzer.get_or_load_parsed(&file_path) {
+            let parsed = match self.analyzer.get_or_load_parsed(&file_path) {
                 Ok(p) => p,
                 Err(err) => {
                     eprintln!("{err}");
@@ -93,24 +95,16 @@ impl Engine {
         print_outputs(&outputs);
 
         let elapsed = start.elapsed();
-        println!(
-            "Completed in {:?} (cache hits: {}, misses: {})",
-            elapsed, engine.stats.hits, engine.stats.misses
-        );
+        println!("Completed in {:?}", elapsed);
     }
 
     fn analyze_match(
         &mut self,
+        file_path: &str,
         language: LanguageKind,
         m: &MatchOccurence,
     ) -> Option<SnippetCandidate> {
-        if self.analyzer.has_file(&m.file_path) {
-            self.stats.hits += 1;
-        } else {
-            self.stats.misses += 1;
-        }
-
-        let parsed = match self.analyzer.get_or_load_parsed(&m.file_path) {
+        let parsed = match self.analyzer.get_or_load_parsed(file_path) {
             Ok(p) => p,
             Err(err) => {
                 eprintln!("{err}");
@@ -124,14 +118,14 @@ impl Engine {
         if global_end <= global_start {
             eprintln!(
                 "warning: skipping invalid range for {}:{} line_range=[{}..{}]",
-                m.file_path, m.line_number, m.start_byte, m.end_byte
+                file_path, m.line_number, m.start_byte, m.end_byte
             );
             return None;
         }
         if global_start >= parsed.source.len() || global_end > parsed.source.len() {
             eprintln!(
                 "warning: skipping out-of-bounds range for {}:{} file_range=[{}..{}] source_len={}",
-                m.file_path,
+                file_path,
                 m.line_number,
                 global_start,
                 global_end,
@@ -149,7 +143,7 @@ impl Engine {
             Some(current) => {
                 let bounds_node = select_context_node(parsed, root, current, language);
                 Some(SnippetCandidate {
-                    file_path: m.file_path.clone(),
+                    file_path: file_path.to_string(),
                     line_num: m.line_number,
                     node_type: current.kind().to_string(),
                     snippet_start: bounds_node.start_byte(),
@@ -161,7 +155,7 @@ impl Engine {
             None => {
                 eprintln!(
                     "warning: no syntax node found for {}:{}",
-                    m.file_path, m.line_number
+                    file_path, m.line_number
                 );
                 None
             }

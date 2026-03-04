@@ -15,9 +15,15 @@ pub(crate) struct ParsedFile {
     pub tree: Tree,
 }
 
+pub struct AnalyzerStats {
+    hits: usize,
+    misses: usize,
+}
+
 pub struct Analyzer {
     parsers: HashMap<LanguageKind, Parser>,
     files: HashMap<String, ParsedFile>,
+    stats: AnalyzerStats,
 }
 
 impl Analyzer {
@@ -25,16 +31,16 @@ impl Analyzer {
         Self {
             parsers: HashMap::new(),
             files: HashMap::new(),
+            stats: AnalyzerStats { hits: 0, misses: 0 },
         }
-    }
-
-    pub fn has_file(&self, path: &str) -> bool {
-        self.files.contains_key(path)
     }
 
     pub fn get_or_load_parsed(&mut self, path: &str) -> Result<&ParsedFile, String> {
         if !self.files.contains_key(path) {
             self.load_file(path)?;
+            self.stats.misses += 1;
+        } else {
+            self.stats.hits += 1;
         }
 
         self.files
