@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::analyzer::LanguageKind;
+use crate::{analyzer::LanguageKind, parsed_file::ParsedFile};
 
 pub fn language_for_path(path: &str) -> Option<LanguageKind> {
     let extension = Path::new(path).extension()?.to_str()?;
@@ -79,4 +79,68 @@ pub fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     }
 
     merged
+}
+
+pub fn is_root_like(node: tree_sitter::Node<'_>, root: tree_sitter::Node<'_>) -> bool {
+    let same_as_root_range =
+        node.start_byte() == root.start_byte() && node.end_byte() == root.end_byte();
+    let root_like_kind = matches!(node.kind(), "source_file" | "program");
+    same_as_root_range || root_like_kind
+}
+
+pub fn node_line_span(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> usize {
+    let start_row = node.start_position().row;
+    let mut end_row = node.end_position().row;
+    if node.end_position().column == 0 && end_row > start_row {
+        end_row = end_row.saturating_sub(1);
+    }
+
+    if parsed.line_count == 0 {
+        return 0;
+    }
+
+    let last = parsed.line_count;
+    let from = start_row.min(last);
+    let to = end_row.min(last);
+    to.saturating_sub(from).saturating_add(1)
+}
+
+pub fn kind_is_tiny(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "shorthand_property_identifier"
+            | "string_content"
+    )
+}
+
+pub fn kind_is_context(language: LanguageKind, kind: &str) -> bool {
+    match language {
+        LanguageKind::Rust => matches!(
+            kind,
+            "let_declaration"
+                | "assignment_expression"
+                | "call_expression"
+                | "if_expression"
+                | "for_expression"
+                | "while_expression"
+                | "match_expression"
+                | "block"
+                | "function_item"
+        ),
+        LanguageKind::TypeScript | LanguageKind::Tsx => matches!(
+            kind,
+            "variable_declarator"
+                | "assignment_expression"
+                | "call_expression"
+                | "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "statement_block"
+                | "function_declaration"
+                | "method_definition"
+        ),
+    }
 }
