@@ -2,6 +2,7 @@ mod analyzer;
 mod engine;
 mod helpers;
 mod output;
+mod parsed_file;
 mod ripgrep;
 
 use std::env;
@@ -13,13 +14,6 @@ const COLOR_PATH_DIM: &str = "\x1b[90m";
 const COLOR_LINE_NUM: &str = "\x1b[36m";
 const COLOR_META_MILD: &str = "\x1b[2;37m";
 const COLOR_HIGHLIGHT: &str = "\x1b[1;33m";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum LanguageKind {
-    Rust,
-    TypeScript,
-    Tsx,
-}
 
 fn parse_cli_args() -> Result<(String, String), String> {
     let args = env::args().collect::<Vec<_>>();

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::LanguageKind;
+use crate::analyzer::LanguageKind;
 
 pub fn language_for_path(path: &str) -> Option<LanguageKind> {
     let extension = Path::new(path).extension()?.to_str()?;
@@ -12,35 +12,16 @@ pub fn language_for_path(path: &str) -> Option<LanguageKind> {
     }
 }
 
-pub fn compute_line_offsets(source: &str) -> (Vec<usize>, Vec<usize>) {
+pub fn compute_line_byte_offsets(source: &str) -> Vec<usize> {
     let mut starts = Vec::new();
-    let mut ends = Vec::new();
     let mut offset = 0usize;
 
     for segment in source.split_inclusive('\n') {
         starts.push(offset);
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        ends.push(offset.saturating_add(line.len()));
         offset = offset.saturating_add(segment.len());
     }
 
-    (starts, ends)
-}
-
-pub fn line_bounds_for_byte_range(
-    line_starts: &[usize],
-    line_ends: &[usize],
-    start_byte: usize,
-    end_byte: usize,
-) -> (usize, usize) {
-    if line_starts.is_empty() || line_ends.is_empty() {
-        return (0, 0);
-    }
-
-    let from = find_line_for_byte(line_starts, start_byte);
-    let end_inclusive = end_byte.saturating_sub(1);
-    let to = find_line_for_byte(line_starts, end_inclusive);
-    (from + 1, to + 1)
+    starts
 }
 
 pub fn render_segment_with_highlights(
@@ -98,10 +79,4 @@ pub fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     }
 
     merged
-}
-
-fn find_line_for_byte(line_starts: &[usize], byte: usize) -> usize {
-    let idx = line_starts.partition_point(|&s| s <= byte);
-    idx.saturating_sub(1)
-        .min(line_starts.len().saturating_sub(1))
 }

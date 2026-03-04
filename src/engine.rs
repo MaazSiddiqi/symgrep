@@ -1,15 +1,12 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    time::Instant,
-};
+use std::time::Instant;
+
+use tree_sitter::Node;
 
 use crate::{
-    LanguageKind,
-    analyzer::{Analyzer, ParsedFile},
-    helpers::{
-        language_for_path, line_bounds_for_byte_range, merge_ranges, render_segment_with_highlights,
-    },
+    analyzer::{Analyzer, LanguageKind},
+    helpers::{language_for_path, merge_ranges, render_segment_with_highlights},
     output::{OutputRecord, print_outputs},
+    parsed_file::ParsedFile,
     ripgrep::{GrepConfig, MatchOccurence, RipGrep},
 };
 
@@ -19,9 +16,7 @@ pub struct Engine {
 
 #[derive(Debug, Clone)]
 struct SnippetCandidate {
-    file_path: String,
     line_num: u64,
-    node_type: String,
     snippet_start: usize,
     snippet_end: usize,
     match_start: usize,
@@ -34,7 +29,6 @@ struct MergedSnippet {
     snippet_start: usize,
     snippet_end: usize,
     highlights: Vec<(usize, usize)>,
-    node_types: BTreeSet<String>,
 }
 
 impl Engine {
@@ -56,29 +50,8 @@ impl Engine {
             }
         };
 
-        let mut candidates_by_file: HashMap<String, Vec<SnippetCandidate>> = HashMap::new();
-
-        for (file_path, matches) in matches_by_file {
-            let language = match language_for_path(&file_path) {
-                Some(l) => l,
-                None => {
-                    eprintln!("Unknown file extension for file: {file_path}");
-                    continue;
-                }
-            };
-
-            for m in matches {
-                if let Some(candidate) = self.analyze_match(&file_path, language, &m) {
-                    candidates_by_file
-                        .entry(candidate.file_path.clone())
-                        .or_default()
-                        .push(candidate);
-                }
-            }
-        }
-
         let mut outputs: Vec<OutputRecord> = Vec::new();
-        for (file_path, candidates) in candidates_by_file {
+        for (file_path, matches) in matches_by_file {
             let parsed = match self.analyzer.get_or_load_parsed(&file_path) {
                 Ok(p) => p,
                 Err(err) => {
@@ -86,6 +59,12 @@ impl Engine {
                     continue;
                 }
             };
+
+            let candidates: Vec<SnippetCandidate> = matches
+                .into_iter()
+                .map(|m| Self::analyze_match(&file_path, parsed, &m))
+                .collect();
+
             outputs.extend(build_output_records_for_file(
                 &file_path, parsed, candidates,
             ));
@@ -98,67 +77,30 @@ impl Engine {
         println!("Completed in {:?}", elapsed);
     }
 
-    fn analyze_match(
-        &mut self,
-        file_path: &str,
-        language: LanguageKind,
-        m: &MatchOccurence,
-    ) -> Option<SnippetCandidate> {
-        let parsed = match self.analyzer.get_or_load_parsed(file_path) {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("{err}");
-                return None;
-            }
-        };
-
+    fn analyze_match(file_path: &str, parsed: &ParsedFile, m: &MatchOccurence) -> SnippetCandidate {
         let global_start = m.start_byte as usize;
         let global_end = m.end_byte as usize;
 
-        if global_end <= global_start {
-            eprintln!(
-                "warning: skipping invalid range for {}:{} line_range=[{}..{}]",
-                file_path, m.line_number, m.start_byte, m.end_byte
-            );
-            return None;
-        }
-        if global_start >= parsed.source.len() || global_end > parsed.source.len() {
-            eprintln!(
-                "warning: skipping out-of-bounds range for {}:{} file_range=[{}..{}] source_len={}",
-                file_path,
-                m.line_number,
-                global_start,
-                global_end,
-                parsed.source.len()
-            );
-            return None;
-        }
+        let context_node: Option<Node> = parsed.tree.as_ref().and_then(|tree| {
+            let root = tree.root_node();
+            let node = root
+                .named_descendant_for_byte_range(global_start, global_end)
+                .or_else(|| root.descendant_for_byte_range(global_start, global_end))?;
+            let language = language_for_path(file_path)?;
+            Some(select_context_node(parsed, root, node, language))
+        });
 
-        let root = parsed.tree.root_node();
-        let node = root
-            .named_descendant_for_byte_range(global_start, global_end)
-            .or_else(|| root.descendant_for_byte_range(global_start, global_end));
+        let (snippet_start, snippet_end): (usize, usize) = match context_node {
+            Some(node) => (node.start_byte(), node.end_byte()),
+            None => parsed.line_bounds_for_byte_range(global_start, global_end),
+        };
 
-        match node {
-            Some(current) => {
-                let bounds_node = select_context_node(parsed, root, current, language);
-                Some(SnippetCandidate {
-                    file_path: file_path.to_string(),
-                    line_num: m.line_number,
-                    node_type: current.kind().to_string(),
-                    snippet_start: bounds_node.start_byte(),
-                    snippet_end: bounds_node.end_byte(),
-                    match_start: global_start,
-                    match_end: global_end,
-                })
-            }
-            None => {
-                eprintln!(
-                    "warning: no syntax node found for {}:{}",
-                    file_path, m.line_number
-                );
-                None
-            }
+        SnippetCandidate {
+            line_num: m.line_number,
+            snippet_start,
+            snippet_end,
+            match_start: m.start_byte as usize,
+            match_end: m.end_byte as usize,
         }
     }
 }
@@ -180,12 +122,8 @@ fn build_output_records_for_file(
     merged
         .into_iter()
         .map(|m| {
-            let (node_line_from, node_line_to) = line_bounds_for_byte_range(
-                &parsed.line_starts,
-                &parsed.line_ends,
-                m.snippet_start,
-                m.snippet_end,
-            );
+            let (node_line_from, node_line_to) =
+                parsed.line_bounds_for_byte_range(m.snippet_start, m.snippet_end);
             let rendered_lines = render_segment_with_highlights(
                 &parsed.source,
                 m.snippet_start,
@@ -213,17 +151,13 @@ fn merge_candidates(candidates: Vec<SnippetCandidate>) -> Vec<MergedSnippet> {
                 current.snippet_end = current.snippet_end.max(c.snippet_end);
                 current.line_num = current.line_num.min(c.line_num);
                 current.highlights.push((c.match_start, c.match_end));
-                current.node_types.insert(c.node_type);
             }
             _ => {
-                let mut node_types = BTreeSet::new();
-                node_types.insert(c.node_type);
                 out.push(MergedSnippet {
                     line_num: c.line_num,
                     snippet_start: c.snippet_start,
                     snippet_end: c.snippet_end,
                     highlights: vec![(c.match_start, c.match_end)],
-                    node_types,
                 });
             }
         }
@@ -296,11 +230,11 @@ fn node_line_span(parsed: &ParsedFile, node: tree_sitter::Node<'_>) -> usize {
         end_row = end_row.saturating_sub(1);
     }
 
-    if parsed.lines.is_empty() {
+    if parsed.line_count == 0 {
         return 0;
     }
 
-    let last = parsed.lines.len() - 1;
+    let last = parsed.line_count;
     let from = start_row.min(last);
     let to = end_row.min(last);
     to.saturating_sub(from).saturating_add(1)

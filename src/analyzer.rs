@@ -1,29 +1,19 @@
 use std::{collections::HashMap, fs};
 
-use tree_sitter::{Parser, Tree};
+use tree_sitter::Parser;
 
-use crate::{
-    LanguageKind,
-    helpers::{compute_line_offsets, language_for_path},
-};
+use crate::{helpers::language_for_path, parsed_file::ParsedFile};
 
-pub(crate) struct ParsedFile {
-    pub source: String,
-    pub lines: Vec<String>,
-    pub line_starts: Vec<usize>,
-    pub line_ends: Vec<usize>,
-    pub tree: Tree,
-}
-
-pub struct AnalyzerStats {
-    hits: usize,
-    misses: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LanguageKind {
+    Rust,
+    TypeScript,
+    Tsx,
 }
 
 pub struct Analyzer {
     parsers: HashMap<LanguageKind, Parser>,
     files: HashMap<String, ParsedFile>,
-    stats: AnalyzerStats,
 }
 
 impl Analyzer {
@@ -31,16 +21,12 @@ impl Analyzer {
         Self {
             parsers: HashMap::new(),
             files: HashMap::new(),
-            stats: AnalyzerStats { hits: 0, misses: 0 },
         }
     }
 
     pub fn get_or_load_parsed(&mut self, path: &str) -> Result<&ParsedFile, String> {
         if !self.files.contains_key(path) {
             self.load_file(path)?;
-            self.stats.misses += 1;
-        } else {
-            self.stats.hits += 1;
         }
 
         self.files
@@ -49,69 +35,52 @@ impl Analyzer {
     }
 
     fn load_file(&mut self, path: &str) -> Result<(), String> {
-        let language = match language_for_path(path) {
-            Some(l) => l,
-            None => return Err(format!("Unknown file extension for file: {path}")),
-        };
-
-        self.load_parser(language)?;
-
-        let parser = match self.parsers.get_mut(&language) {
-            Some(p) => p,
-            None => {
-                return Err(format!(
-                    "Parser for language '{:?}' has not been initialized",
-                    language
-                ));
-            }
-        };
-
         let source =
             fs::read_to_string(path).map_err(|err| format!("Failed to read {path}: {err}"))?;
 
-        let tree = parser
-            .parse(&source, None)
-            .ok_or_else(|| format!("Failed to parse {path} with tree-sitter"))?;
+        let tree = match language_for_path(path) {
+            Some(language) => {
+                self.load_parser(language)?;
 
-        let lines = source.lines().map(ToString::to_string).collect::<Vec<_>>();
-        let (line_starts, line_ends) = compute_line_offsets(&source);
+                let parser = self.parsers.get_mut(&language).ok_or_else(|| {
+                    format!(
+                        "Parser for language '{:?}' has not been initialized",
+                        language
+                    )
+                })?;
 
-        self.files.insert(
-            path.to_string(),
-            ParsedFile {
-                source,
-                lines,
-                line_starts,
-                line_ends,
-                tree,
-            },
-        );
+                let tree = parser
+                    .parse(&source, None)
+                    .ok_or_else(|| format!("Failed to parse {path} with tree-sitter"))?;
+
+                Some(tree)
+            }
+            None => None,
+        };
+
+        self.files
+            .insert(path.to_string(), ParsedFile::new(source, tree));
         Ok(())
     }
 
-    fn load_parser(&mut self, language: LanguageKind) -> Result<(), String> {
+    fn load_parser(&mut self, language: LanguageKind) -> Result<&Parser, String> {
         if self.parsers.contains_key(&language) {
-            return Ok(());
+            return Ok(&self.parsers[&language]);
         }
 
         let mut parser = tree_sitter::Parser::new();
 
-        let result = match language {
-            LanguageKind::Rust => parser.set_language(&tree_sitter_rust::LANGUAGE.into()),
-            LanguageKind::TypeScript => {
-                parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            }
-            LanguageKind::Tsx => parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()),
+        let ts_language = match language {
+            LanguageKind::Rust => tree_sitter_rust::LANGUAGE,
+            LanguageKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+            LanguageKind::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
         };
 
-        if result.is_err() {
-            return Err(format!(
-                "Unsupported tree-sitter language '{:?}' requested",
-                language
-            ));
-        }
+        parser.set_language(&ts_language.into()).map_err(|err| {
+            format!("Failed to set tree-sitter language for '{language:?}': {err}")
+        })?;
 
         self.parsers.insert(language, parser);
-        Ok(())
+        Ok(&self.parsers[&language])
     }
 }
