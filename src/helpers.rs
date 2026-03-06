@@ -132,15 +132,22 @@ pub fn kind_is_context(language: LanguageKind, kind: &str) -> bool {
         ),
         LanguageKind::TypeScript | LanguageKind::Tsx => matches!(
             kind,
-            "variable_declarator"
-                | "assignment_expression"
-                | "call_expression"
-                | "if_statement"
-                | "for_statement"
-                | "while_statement"
-                | "statement_block"
-                | "function_declaration"
-                | "method_definition"
+            "function_declaration"
+                    | "arrow_function"
+                    | "lexical_declaration"
+                    | "export_statement"
+                    | "interface_declaration"
+                    | "type_alias_declaration"
+                    | "jsx_element"
+                    | "jsx_self_closing_element"
+                    // call / usage sites
+                    // | "call_expression"
+                    // | "member_expression"
+                    | "jsx_attribute"
+                    // ts-specific
+                    | "satisfies_expression"
+                    | "generic_type"
+                    | "template_string"
         ),
     }
 }

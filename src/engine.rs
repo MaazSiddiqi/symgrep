@@ -217,3 +217,145 @@ impl Engine {
         selected
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse_rust(source: &str) -> ParsedFile {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("should configure rust parser");
+        let tree = parser
+            .parse(source, None)
+            .expect("should parse rust source");
+        ParsedFile::new(source.to_string(), Some(tree))
+    }
+
+    fn selected_context_node_for_needle<'a>(
+        parsed: &'a ParsedFile,
+        needle: &str,
+    ) -> tree_sitter::Node<'a> {
+        let tree = parsed.tree.as_ref().expect("tree should exist");
+        let root = tree.root_node();
+
+        let start = parsed
+            .source
+            .find(needle)
+            .expect("needle should exist in source");
+        let end = start + needle.len();
+
+        let current = root
+            .named_descendant_for_byte_range(start, end)
+            .or_else(|| root.descendant_for_byte_range(start, end))
+            .expect("should find AST node for needle");
+
+        Engine::select_context_node(parsed, root, current, LanguageKind::Rust)
+    }
+
+    #[test]
+    fn select_context_node_for_function_definition_name() {
+        let source = r#"
+fn target_fn(value: i32) -> i32 {
+    let doubled = value * 2;
+    doubled
+}
+"#;
+        let expected_kind = "function_item";
+        let expected_context = r#"
+fn target_fn(value: i32) -> i32 {
+    let doubled = value * 2;
+    doubled
+}
+"#;
+
+        let parsed = parse_rust(source);
+        let selected = selected_context_node_for_needle(&parsed, "target_fn");
+        assert_eq!(selected.kind(), expected_kind);
+        let selected_text = selected
+            .utf8_text(parsed.source.as_bytes())
+            .expect("selected context should be valid utf8");
+        assert_eq!(selected_text.trim(), expected_context.trim());
+    }
+
+    #[test]
+    fn select_context_node_for_multiline_let_assignment() {
+        let source = r#"
+fn main() {
+    let target =
+        21 + 21;
+    println!("{}", target);
+}
+"#;
+        let expected_kind = "let_declaration";
+        let expected_context = r#"
+let target =
+        21 + 21;
+"#;
+
+        let parsed = parse_rust(source);
+        let selected = selected_context_node_for_needle(&parsed, "target");
+        assert_eq!(selected.kind(), expected_kind);
+        let selected_text = selected
+            .utf8_text(parsed.source.as_bytes())
+            .expect("selected context should be valid utf8");
+        assert_eq!(selected_text.trim(), expected_context.trim());
+    }
+
+    #[test]
+    fn select_context_node_for_multiline_call_usage() {
+        let source = r#"
+fn main() {
+    let result = compute_target(
+        10,
+        20,
+    );
+    println!("{}", result);
+}
+"#;
+        let expected_kind = "call_expression";
+        let expected_context = r#"
+let result = compute_target(
+        10,
+        20,
+    )
+"#;
+
+        let parsed = parse_rust(source);
+        let selected = selected_context_node_for_needle(&parsed, "compute_target");
+        assert_eq!(selected.kind(), expected_kind);
+        let selected_text = selected
+            .utf8_text(parsed.source.as_bytes())
+            .expect("selected context should be valid utf8");
+        assert_eq!(selected_text.trim(), expected_context.trim());
+    }
+
+    #[test]
+    fn select_context_node_for_non_context_usage_falls_back_to_block() {
+        let source = r#"
+fn main() {
+    let target = 10;
+    let computed = target + 5;
+    println!("{}", computed);
+}
+"#;
+        let expected_kind = "block";
+        let expected_context = r#"
+{
+    let target = 10;
+    let computed = target + 5;
+    println!("{}", computed);
+}
+"#;
+
+        let parsed = parse_rust(source);
+        let selected = selected_context_node_for_needle(&parsed, "target");
+        assert_eq!(selected.kind(), expected_kind);
+        let selected_text = selected
+            .utf8_text(parsed.source.as_bytes())
+            .expect("selected context should be valid utf8");
+        assert_eq!(selected_text.trim(), expected_context.trim());
+    }
+}
