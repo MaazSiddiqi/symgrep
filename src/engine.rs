@@ -59,13 +59,15 @@ impl Engine {
                 continue;
             };
 
-            let candidates: Vec<SnippetCandidate> = matches
+            let mut candidates: Vec<SnippetCandidate> = matches
                 .into_iter()
                 .map(|m| Self::analyze_match(&file_path, parsed, &m))
                 .collect();
 
             outputs.extend(Engine::build_output_records_for_file(
-                &file_path, parsed, candidates,
+                &file_path,
+                parsed,
+                candidates.as_mut(),
             ));
         }
 
@@ -106,7 +108,7 @@ impl Engine {
     fn build_output_records_for_file(
         file_path: &str,
         parsed: &ParsedFile,
-        mut candidates: Vec<SnippetCandidate>,
+        candidates: &mut Vec<SnippetCandidate>,
     ) -> Vec<OutputRecord> {
         candidates.sort_by(|a, b| {
             a.snippet_start
@@ -140,7 +142,7 @@ impl Engine {
             .collect()
     }
 
-    fn merge_candidates(candidates: Vec<SnippetCandidate>) -> Vec<MergedSnippet> {
+    fn merge_candidates(candidates: &Vec<SnippetCandidate>) -> Vec<MergedSnippet> {
         let mut out: Vec<MergedSnippet> = Vec::new();
 
         for c in candidates {
